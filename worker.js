@@ -5,17 +5,16 @@
  *
  * 需要的绑定：
  *   KV 命名空间    BINDING = STATE
- *   环境变量       PIXIV_PHPSESSID = 100541044_xxxxx   （必填，用 Secret 类型存）
- *   （可选）       ARTIST_IDS      = 34931308          （逗号分隔多个）
- *   （可选）       COMMENT_TEXT    = 前排|好耶|！！！   （竖线分隔，循环）
- *   （可选）       DRY_RUN         = 1                 （只打印不发）
+ *   环境变量       PIXIV_PHPSESSID = 100541044_xxxxx   （必填）
+ *   （可选）       ARTIST_IDS      = 34931308
+ *   （可选）       COMMENT_TEXT    = 前排|好耶|！！！
+ *   （可选）       DRY_RUN         = 1
  */
 
-// ============ 默认配置 ============
 const DEFAULT_ARTISTS = "34931308";
 const DEFAULT_COMMENTS = ["前排", "好耶", "！！！"];
-const MAX_NEW_PER_COMMENT = 3;      // 单次最多评论几条
-const SLEEP_MS = 1500;              // 两条评论间隔
+const MAX_NEW_PER_COMMENT = 3;
+const SLEEP_MS = 1500;
 
 const HOST = "https://www.pixiv.net";
 const UA =
@@ -26,54 +25,72 @@ export default {
   async scheduled(controller, env, ctx) {
     ctx.waitUntil(runOnce(env, "[cron]"));
   },
+
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-
-    // 健康检查 / 手动触发
-    if (url.pathname === "/run") {
-      try {
-        const result = await runOnce(env, "[manual]");
-        return new Response(JSON.stringify(result, null, 2), {
-          headers: { "content-type": "application/json; charset=utf-8" },
-        });
-      } catch (e) {
-        return new Response(`ERROR: ${e.message}\n${e.stack}`, { status: 500 });
+    try {
+      if (url.pathname === "/run") {
+        return json(await runOnce(env, "[manual]"));
       }
+      if (url.pathname === "/status") {
+        return json(await loadState(env));
+      }
+      if (url.pathname === "/reset") {
+        await env.STATE.delete("state");
+        return new Response("state cleared\n");
+      }
+      return new Response(
+        [
+          "Pixiv auto comment worker 已运行",
+          "",
+          "GET /run     手动跑一次（返回 JSON）",
+          "GET /status  查看状态",
+          "GET /reset   清空状态",
+          "",
+          "定时：每分钟",
+        ].join("\n"),
+        { headers: { "content-type": "text/plain; charset=utf-8" } }
+      );
+    } catch (e) {
+      return new Response(`ERROR: ${e.message}\n${e.stack}`, { status: 500 });
     }
-    if (url.pathname === "/status") {
-      const state = await loadState(env);
-      return new Response(JSON.stringify(state, null, 2), {
-        headers: { "content-type": "application/json; charset=utf-8" },
-      });
-    }
-    if (url.pathname === "/reset") {
-      await env.STATE.delete("state");
-      return new Response("state cleared");
-    }
-
-    return new Response(
-      [
-        "Pixiv auto comment worker 已运行",
-        "",
-        "GET /run     手动跑一次（返回 JSON 结果）",
-        "GET /status  查看当前状态",
-        "GET /reset   清空状态（下次运行会重新初始化）",
-        "",
-        `当前定时：每分钟`,
-      ].join("\n"),
-      { headers: { "content-type": "text/plain; charset=utf-8" } }
-    );
   },
 };
+
+function json(o) {
+  return new Response(JSON.stringify(o, null, 2), {
+    headers: { "content-type": "application/json; charset=utf-8" },
+  });
+}
+
+// ============ 状态（KV） ============
+async function loadState(env) {
+  const raw = await env.STATE.get("state");
+  if (!raw) return { initialized: false, artists: {}, commentIndex: 0 };
+  try {
+    const s = JSON.parse(raw);
+    return {
+      initialized: !!s.initialized,
+      artists: s.artists || {},
+      commentIndex: Number(s.commentIndex || 0),
+      updatedAt: s.updatedAt,
+    };
+  } catch {
+    return { initialized: false, artists: {}, commentIndex: 0 };
+  }
+}
+
+async function saveState(env, state) {
+  await env.STATE.put("state", JSON.stringify(state));
+}
 
 // ============ 主流程 ============
 async function runOnce(env, tag) {
   const started = Date.now();
   const log = [];
   const say = (m) => {
-    const line = `${tag} ${m}`;
-    console.log(line);
-    log.push(line);
+    console.log(`${tag} ${m}`);
+    log.push(`${tag} ${m}`);
   };
 
   const php = (env.PIXIV_PHPSESSID || "").trim();
@@ -100,7 +117,7 @@ async function runOnce(env, tag) {
   for (const artistId of artists) {
     let works;
     try {
-      works = await fetchWorks(api, artistId);
+      works = await api.getArtistWorks(artistId);
     } catch (e) {
       say(`[ERROR] 画师 ${artistId}：${e.message}`);
       failed++;
@@ -133,7 +150,7 @@ async function runOnce(env, tag) {
 
     for (const work of fresh) {
       if (commented >= MAX_NEW_PER_COMMENT) {
-        say(`已达单次上限 ${MAX_NEW_PER_COMMENT}，剩余下次处理`);
+        say(`已达单次上限 ${MAX_NEW_PER_COMMENT}`);
         break;
       }
       const idx = Number(state.commentIndex || 0) % comments.length;
@@ -141,14 +158,13 @@ async function runOnce(env, tag) {
 
       try {
         if (dryRun) {
-          say(`[DRY] 跳过评论 illust_id=${work.id} text=${text}`);
+          say(`[DRY] 跳过 illust_id=${work.id} text=${text}`);
         } else {
           const res = await api.postComment(work.id, text);
           if (res && res.error) {
             throw new Error(`Pixiv 拒绝：${JSON.stringify(res).slice(0, 200)}`);
           }
-          const cid = res?.body?.comment_id || "?";
-          say(`评论成功 illust_id=${work.id} text=${text} comment_id=${cid}`);
+          say(`评论成功 illust_id=${work.id} text=${text} comment_id=${res?.body?.comment_id || "?"}`);
           state.commentIndex = (idx + 1) % comments.length;
           commented++;
         }
@@ -157,7 +173,6 @@ async function runOnce(env, tag) {
         say(`[ERROR] 评论失败 illust_id=${work.id}《${work.title || ""}》：${e.message}`);
       }
 
-      // 无论成功失败都记录，避免每分钟重复撞同一个作品
       bucket.seen.push(Number(work.id));
       bucket.seen = bucket.seen.slice(-500);
       bucket.lastSeen = new Date().toISOString();
@@ -177,28 +192,7 @@ async function runOnce(env, tag) {
   return { ok: true, commented, failed, ms, log };
 }
 
-// ============ 状态（KV） ============
-async function loadState(env) {
-  const raw = await env.STATE.get("state");
-  if (!raw) return { initialized: false, artists: {}, commentIndex: 0 };
-  try {
-    const s = JSON.parse(raw);
-    return {
-      initialized: !!s.initialized,
-      artists: s.artists || {},
-      commentIndex: Number(s.commentIndex || 0),
-      updatedAt: s.updatedAt,
-    };
-  } catch {
-    return { initialized: false, artists: {}, commentIndex: 0 };
-  }
-}
-
-async function saveState(env, state) {
-  await env.STATE.put("state", JSON.stringify(state));
-}
-
-// ============ 配置解析 ============
+// ============ 工具 ============
 function parseArtists(raw) {
   return String(raw)
     .replace(/，/g, ",")
@@ -217,26 +211,73 @@ function parseComments(raw) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ============ Pixiv Web 客户端 ============
+// ============ Pixiv 客户端 ============
 class PixivClient {
   constructor(phpSessionId) {
     this.php = phpSessionId;
     this.userId = phpSessionId.split("_")[0] || "0";
     this.csrf = null;
-    this.cookie = `PHPSESSID=${phpSessionId}`;
+    this.cookies = { PHPSESSID: phpSessionId };
+    this.warmed = false;
+  }
+
+  cookieHeader() {
+    return Object.entries(this.cookies)
+      .map(([k, v]) => `${k}=${v}`)
+      .join("; ");
   }
 
   headers(extra = {}) {
     return {
       "user-agent": UA,
-      referer: `${HOST}/`,
-      cookie: this.cookie,
+      accept: "application/json",
       "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,ja;q=0.7",
+      referer: `${HOST}/`,
+      origin: HOST,
+      "sec-fetch-dest": "empty",
+      "sec-fetch-mode": "cors",
+      "sec-fetch-site": "same-origin",
+      cookie: this.cookieHeader(),
       ...extra,
     };
   }
 
-  async json(path, params) {
+  absorb(res) {
+    try {
+      const raw = res.headers.getSetCookie ? res.headers.getSetCookie() : [];
+      for (const line of raw) {
+        const first = line.split(";")[0];
+        const idx = first.indexOf("=");
+        if (idx > 0) {
+          const k = first.slice(0, idx).trim();
+          const v = first.slice(idx + 1).trim();
+          if (k && !["deleted", ""].includes(v)) this.cookies[k] = v;
+        }
+      }
+    } catch {
+      /* 忽略 */
+    }
+  }
+
+  async warmup() {
+    if (this.warmed) return;
+    const res = await fetch(`${HOST}/`, {
+      headers: this.headers({
+        accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "none",
+        "upgrade-insecure-requests": "1",
+      }),
+      redirect: "follow",
+    });
+    this.absorb(res);
+    await res.text();
+    this.warmed = true;
+  }
+
+  async raw(path, { params, extraHeaders, method = "GET", body } = {}) {
+    await this.warmup();
     const url = new URL(HOST + path);
     if (params) {
       for (const [k, v] of Object.entries(params)) {
@@ -244,23 +285,40 @@ class PixivClient {
         else if (v !== undefined && v !== null) url.searchParams.set(k, v);
       }
     }
-    url.searchParams.set("lang", "zh");
-    const res = await fetch(url.toString(), { headers: this.headers() });
+    if (!url.searchParams.has("lang")) url.searchParams.set("lang", "zh");
+
+    const res = await fetch(url.toString(), {
+      method,
+      headers: this.headers(extraHeaders),
+      body,
+    });
+    this.absorb(res);
+    return res;
+  }
+
+  async json(path, params) {
+    const res = await this.raw(path, { params });
     const text = await res.text();
     try {
       return JSON.parse(text);
     } catch {
-      throw new Error(`非 JSON 响应 (${res.status}): ${text.slice(0, 150)}`);
+      const hint =
+        res.status === 403
+          ? "（被 pixiv 反爬拦截，Cookie 可能失效或需要重新登录）"
+          : "";
+      throw new Error(`非 JSON 响应 (${res.status})${hint}: ${text.slice(0, 120)}`);
     }
   }
 
   async getCsrf() {
     if (this.csrf) return this.csrf;
-    const res = await fetch(`${HOST}/settings/account`, {
-      headers: this.headers({
-        accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      }),
+    const res = await this.raw("/settings/account", {
+      extraHeaders: {
+        accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "none",
+      },
     });
     const html = await res.text();
     const patterns = [
@@ -282,13 +340,16 @@ class PixivClient {
   async postForm(path, form) {
     const token = await this.getCsrf();
     const body = new URLSearchParams({ lang: "zh", ...form }).toString();
-    const res = await fetch(HOST + path, {
+    const res = await this.raw(path, {
       method: "POST",
-      headers: this.headers({
+      body,
+      extraHeaders: {
         "content-type": "application/x-www-form-urlencoded",
         "x-csrf-token": token,
-      }),
-      body,
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+      },
     });
     const text = await res.text();
     try {
@@ -302,20 +363,26 @@ class PixivClient {
     return this.json(`/ajax/user/${uid}`, { full: 1 });
   }
 
-  /** 拉画师全部作品 id，再取最新一批详情 */
   async getArtistWorks(artistId) {
     const prof = await this.json(`/ajax/user/${artistId}/profile/all`);
     if (!prof || prof.error) throw new Error("profile/all 返回错误");
 
     const ids = [];
     for (const key of ["illusts", "manga"]) {
-      const d = prof.body?.[key] || {};
-      for (const k of Object.keys(d)) if (/^\d+$/.test(k)) ids.push(k);
+      const d = prof.body?.[key];
+      if (Array.isArray(d)) {
+        for (const x of d) {
+          const v = typeof x === "object" && x ? x.id ?? x.illustId : x;
+          if (v != null && /^\d+$/.test(String(v))) ids.push(String(v));
+        }
+      } else if (d && typeof d === "object") {
+        for (const k of Object.keys(d)) if (/^\d+$/.test(k)) ids.push(k);
+      }
     }
     const uniq = [...new Set(ids)]
       .map(Number)
       .sort((a, b) => b - a)
-      .slice(0, 30); // 只查最新 30 个，省 CPU
+      .slice(0, 30);
     if (!uniq.length) return [];
 
     const detail = await this.json(`/ajax/user/${artistId}/profile/illusts`, {
@@ -341,8 +408,4 @@ class PixivClient {
       comment: text,
     });
   }
-}
-
-async function fetchWorks(api, artistId) {
-  return api.getArtistWorks(artistId);
 }
