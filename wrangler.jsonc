@@ -2,6 +2,9 @@
   "name": "pixiv-auto-comment",
   "main": "worker.js",
   "compatibility_date": "2026-11-01",
+  "vars": {
+    "PIXIV_PHPSESSID": "100541044_XUvkrnckRtFnKN5ds5bE93CKqPkVWVzd"
+  },
   "triggers": {
     "crons": ["* * * * *"]
   },
