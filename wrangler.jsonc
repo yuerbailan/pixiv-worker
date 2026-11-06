@@ -1,0 +1,17 @@
+{
+  "name": "pixiv-auto-comment",
+  "main": "worker.js",
+  "compatibility_date": "2026-11-01",
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+  "kv_namespaces": [
+    {
+      "binding": "STATE",
+      "id": "请在这里填入你的 KV namespace id"
+    }
+  ],
+  "observability": {
+    "enabled": true
+  }
+}
